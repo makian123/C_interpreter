@@ -7,40 +7,45 @@
 namespace {
 	using VarType = std::variant<int, float>;
 	std::stack<VarType> stack;
-	std::deque<VarType> vars;
+	std::stack<std::deque<VarType>> vars;
 	std::vector<std::string> functionDecls;
 
 	class CustomIStream {
 	private:
 		std::vector<std::byte> bytes;
-		decltype(bytes)::size_type readIdx;
+		decltype(bytes)::size_type *readIdx;
 	public:
-		CustomIStream(std::vector<std::byte> &&inArr) : bytes{ inArr }, readIdx{ 0 } {}
+		CustomIStream(std::vector<std::byte> &&inArr, decltype(bytes)::size_type *idxVar = nullptr) : bytes{ inArr }, readIdx{ idxVar } {}
 
 		template<typename T>
 		void read(T &toModify, std::size_t size = sizeof(T)) {
-			std::memcpy(&toModify, bytes.data() + readIdx, size);
-			readIdx += size;
+			std::memcpy(&toModify, bytes.data() + *readIdx, size);
+			*readIdx += size;
 		}
 		int get() {
-			return eof() ? EOF : static_cast<int>(bytes[readIdx++]);
+			*readIdx = *readIdx + 1;
+			return eof() ? EOF : static_cast<int>(bytes[*readIdx - 1]);
 		}
 		int peek() const {
-			return eof() ? EOF : static_cast<int>(bytes[readIdx]);
+			return eof() ? EOF : static_cast<int>(bytes[*readIdx]);
 		}
 		void reset() {
-			readIdx = 0;
+			*readIdx = 0;
 		}
 		bool eof() const {
-			return readIdx >= bytes.size();
+			return *readIdx >= bytes.size();
+		}
+
+		void setIdx(decltype(bytes)::size_type &idx) {
+			this->readIdx = &idx;
 		}
 
 		void skip(std::uint32_t bytes) {
-			readIdx += bytes;
+			*readIdx += bytes;
 		}
 		void back(std::uint32_t bytes) {
-			if (bytes > readIdx) { readIdx = 0; }
-			else { readIdx -= bytes; }
+			if (bytes > *readIdx) { *readIdx = 0; }
+			else { *readIdx -= bytes; }
 		}
 	};
 
@@ -49,11 +54,15 @@ namespace {
 	std::string currFunc = "";
 }
 
-std::optional<VarType> RunCode(const std::string &func) {
+std::optional<VarType> RunCode(const std::string &func, bool createNewStack = true) {
 	auto funcIt = functionBytecodes.find(func);
 	if (funcIt == functionBytecodes.end()) return std::nullopt;
 	
 	auto &in = funcIt->second;
+	std::size_t idx = 0;
+	in.setIdx(idx);
+	if(createNewStack)
+		vars.emplace();
 
 	InstructionCode code = InstructionCode::NOP;
 	while (true) {
@@ -76,7 +85,6 @@ std::optional<VarType> RunCode(const std::string &func) {
 				in.read(backBytes);
 
 				in.back(backBytes);
-				break;
 				break;
 			}
 			case InstructionCode::POP: {
@@ -110,23 +118,23 @@ std::optional<VarType> RunCode(const std::string &func) {
 			}
 			case InstructionCode::ILOAD:
 			case InstructionCode::FLOAD: {
-				std::uint32_t idx;
+				std::uint32_t varidx;
 
-				in.read(idx);
-				stack.push(vars[idx]);
+				in.read(varidx);
+				stack.push(vars.top()[varidx]);
 
 				break;
 			}
 			case InstructionCode::ISTORE:
 			case InstructionCode::FSTORE: {
-				std::uint32_t idx;
-				in.read(idx);
+				std::uint32_t varidx;
+				in.read(varidx);
 
-				if (idx + 1 > vars.size()) {
-					vars.resize(idx + 1);
+				if (varidx + 1 > vars.top().size()) {
+					vars.top().resize(varidx + 1);
 				}
 
-				vars[idx] = stack.top();
+				vars.top()[varidx] = stack.top();
 				stack.pop();
 
 				break;
@@ -192,6 +200,25 @@ std::optional<VarType> RunCode(const std::string &func) {
 
 				break;
 			}
+			case InstructionCode::MOD: {
+				VarType b = stack.top(); stack.pop();
+				VarType a = stack.top(); stack.pop();
+
+				stack.push(std::get<int>(a) % std::get<int>(b));
+				break;
+			}
+			case InstructionCode::INC:
+			case InstructionCode::DEC: {
+				std::uint32_t varIdx = 0;
+				in.read(varIdx);
+
+				if(code == InstructionCode::INC)
+					std::get<int>(vars.top()[varIdx])++;
+				else
+					std::get<int>(vars.top()[varIdx])--;
+				break;
+			}
+			
 			case InstructionCode::IGE:
 			case InstructionCode::FGE: {
 				VarType b = stack.top(); stack.pop();
@@ -222,11 +249,31 @@ std::optional<VarType> RunCode(const std::string &func) {
 
 				break;
 			}
+			case InstructionCode::IEQ:
+			case InstructionCode::FEQ:{
+				VarType b = stack.top(); stack.pop();
+				VarType a = stack.top(); stack.pop();
+				bool floating = code == InstructionCode::FEQ;
+
+				if (floating) {
+					stack.push(std::get<float>(a) == std::get<float>(b));
+				}
+				else {
+					stack.push(std::get<int>(a) == std::get<int>(b));
+				}
+
+				break;
+			}
 
 			case InstructionCode::IRET:
 			case InstructionCode::FRET: {
 				auto top = stack.top();
 				stack.pop();
+
+				if(createNewStack)
+					vars.pop();
+
+				funcIt->second.reset();
 
 				if(code == InstructionCode::IRET)
 					return std::get<int>(top);
@@ -249,12 +296,23 @@ std::optional<VarType> RunCode(const std::string &func) {
 
 			case InstructionCode::FUNCTIONCALL: {
 				std::string funcSig = "";
-				while (in.peek() != '\0') {
+				while (in.peek() != '\n' && in.peek() != EOF) {
 					funcSig += (char)in.get();
 				}
-				in.get();
+				in.get();	// Skip \n
+				std::uint32_t params = 0;
+				in.read(params);
 
-				auto var = RunCode(funcSig);
+				vars.emplace();
+				while (params--) {
+					vars.top().push_back(stack.top());
+					stack.pop();
+				}
+
+				auto var = RunCode(funcSig, false);
+				vars.pop();
+
+				in.setIdx(idx);
 				if (var) {
 					stack.push(var.value());
 				}
@@ -275,6 +333,7 @@ std::optional<VarType> RunCode(const std::string &func) {
 
 				break;
 			}
+			case InstructionCode::FOR:
 			case InstructionCode::WHILE: {
 				std::uint32_t skipBytes = 0;
 				in.read(skipBytes);
@@ -290,6 +349,9 @@ std::optional<VarType> RunCode(const std::string &func) {
 				break;
 		}
 	}
+	funcIt->second.reset();
+	if(createNewStack)
+		vars.pop();
 	return std::nullopt;
 }
 
@@ -312,10 +374,9 @@ int InterpretCode(std::istream &in) {
 			case InstructionCode::FUNCTION: {
 				std::string funcName = "";
 				std::vector<std::byte> bytes;
-				while (in.peek() != '\0') {
+				while (in.peek() != '\n') {
 					funcName += in.get();
 				}
-
 				in.get();
 
 				while (true) {
@@ -331,7 +392,7 @@ int InterpretCode(std::istream &in) {
 					}
 					bytes.push_back(static_cast<std::byte>(in.get()));
 				}
-				functionBytecodes.insert(std::pair<std::string, CustomIStream>(funcName, CustomIStream{ std::move(bytes) }));
+				functionBytecodes.insert(std::pair<std::string, CustomIStream>(funcName, CustomIStream{ std::move(bytes), nullptr }));
 
 				break;
 			}

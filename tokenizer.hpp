@@ -40,6 +40,8 @@ enum class TokenType: std::uint8_t {
 	DO,
 	WHILE,
 	FOR,
+	BREAK,
+	CONTINUE,
 
 	CONST,
 	UNSIGNED,
@@ -56,6 +58,7 @@ enum class TokenType: std::uint8_t {
 	MINUS,
 	STAR,
 	SLASH,
+	PERCENT,
 
 	COMMA,
 	DOT,
@@ -80,6 +83,14 @@ struct Token {
 	TokenType type = TokenType::NONE;
 	std::uint64_t line = 0, charOffset = 0;
 	std::string value;
+
+	bool IsOfType(TokenType type) const {
+		return this->type == type;
+	}
+	template<typename ...Types>
+	bool IsOfAnyType(std::same_as<TokenType> auto &&...types) const {
+		return ((type == types)||...);
+	}
 };
 
 class Tokenizer {

@@ -20,9 +20,12 @@ namespace {
 
 		{ "if", TokenType::IF },
 		{ "else", TokenType::ELSE},
+
 		{ "do", TokenType::DO},
 		{ "while", TokenType::WHILE},
 		{ "for", TokenType::FOR},
+		{ "break", TokenType::BREAK},
+		{ "continue", TokenType::CONTINUE},
 
 		{ ";", TokenType::SEMICOLON },
 		{ "(", TokenType::OPEN_PARENTH },
@@ -44,6 +47,7 @@ namespace {
 		{ "-" , TokenType::MINUS },
 		{ "*" , TokenType::STAR },
 		{ "/" , TokenType::SLASH },
+		{ "%" , TokenType::PERCENT },
 
 		{ "," , TokenType::COMMA },
 		{ "." , TokenType::DOT },

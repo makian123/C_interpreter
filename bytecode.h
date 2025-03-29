@@ -8,7 +8,7 @@
 
 enum class InstructionCode : std::uint8_t {
 	NONE = 255,
-	NOP = 0,
+	NOP = 128,
 	SKIP,		// skip N bytes
 	BACK,		// go N bytes back
 
@@ -30,8 +30,13 @@ enum class InstructionCode : std::uint8_t {
 	FMUL,		// mul 2 floats from stack
 	IDIV,		// div 2 integers from stack
 	FDIV,		// div 2 floats from stack
+	MOD,		// modulo
+	INC,		// increment
+	DEC,		// decrement
+	IEQ,		// integer equals
 	ILE,		// integer less
 	IGE,		// integer greater
+	FEQ,		// float equals
 	FLE,		// float less
 	FGE,		// float greater
 
@@ -42,6 +47,7 @@ enum class InstructionCode : std::uint8_t {
 	ELSE,
 	ENDIF,
 	WHILE,
+	FOR,
 
 	FTOI,		// float to int
 	ITOF,		// int to float

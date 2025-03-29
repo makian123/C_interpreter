@@ -126,6 +126,12 @@ struct CastExpr : Expression {
 		expr(std::move(express)), 
 		Expression(ExpressionType::CAST) {}
 };
+struct UnaryExpr: Expression{
+	std::unique_ptr<ValueExpr> expr;
+	Token op;
+
+	UnaryExpr(std::unique_ptr<ValueExpr> &&expression, Token oper) : expr(std::move(expression)), op(oper), Expression(ExpressionType::UNARY) {}
+};
 
 enum class StatementType: std::uint8_t {
 	NONE,
@@ -135,6 +141,9 @@ enum class StatementType: std::uint8_t {
 	BLOCK,
 	IF,
 	WHILE,
+	FOR,
+	BREAK,
+	CONTINUE,
 	EXPRSTMT,
 	RETURN,
 };
@@ -178,6 +187,22 @@ struct WhileStmt : Statement {
 
 	WhileStmt(std::unique_ptr<Expression> &&cond, std::unique_ptr<Statement> &&ifTrue)
 		: condition(std::move(cond)), then(std::move(ifTrue)), Statement(StatementType::WHILE) {}
+};
+struct ForStmt : Statement {
+	std::unique_ptr<Statement> initial;
+	std::unique_ptr<Expression> condition;
+	std::unique_ptr<Statement> postLoop;
+
+	std::unique_ptr<Statement> then;
+
+	ForStmt(std::unique_ptr<Statement> &&initialize, std::unique_ptr<Expression> &&cond, std::unique_ptr<Statement> &&postLoop, std::unique_ptr<Statement> &&ifTrue)
+		: initial(std::move(initialize)), condition(std::move(cond)), postLoop(std::move(postLoop)), then(std::move(ifTrue)), Statement(StatementType::FOR) {}
+};
+struct BreakStmt : Statement{
+	BreakStmt() : Statement(StatementType::BREAK) {}
+};
+struct ContinueStmt : Statement {
+	ContinueStmt() : Statement(StatementType::CONTINUE) {}
 };
 struct FuncDeclStmt: Statement{
 	Type* returnType;
@@ -226,7 +251,7 @@ struct Scope {
 	Function *FindFunc(Token name);
 
 	const Type *FindType(Token name) const;
-	const Variable *FindVar(Token name) const;
+	const Variable *FindVar(Token name, bool thisScope = false) const;
 	const Function *FindFunc(Token name) const;
 
 	void PrintAST(std::size_t ident = 0) const;
@@ -243,13 +268,14 @@ class Parser {
 	std::unique_ptr<Expression> ParseExpr(int precedence = 0);
 
 	std::unique_ptr<VarDeclStmt> ParseVarDecl(bool param = false);
-	std::unique_ptr<VarAssignStmt> ParseVarAssign();
+	std::unique_ptr<VarAssignStmt> ParseVarAssign(bool checkSemicolon = true);
 	std::unique_ptr<IfStmt> ParseIf();
 	std::unique_ptr<WhileStmt> ParseWhile();
+	std::unique_ptr<ForStmt> ParseFor();
 	std::unique_ptr<BlockStmt> ParseBlock();
 	std::unique_ptr<FuncDeclStmt> ParseFunc();
 	std::unique_ptr<ReturnStmt> ParseReturn();
-	std::unique_ptr<Statement> ParseStmt();
+	std::unique_ptr<Statement> ParseStmt(bool checkSemicolon = true);
 
 	const Type *GetType();
 public:

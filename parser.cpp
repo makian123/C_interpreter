@@ -10,12 +10,15 @@ namespace {
 		switch (tok) {
 		case Type::STAR:
 		case Type::SLASH:
-			return 3;
+		case Type::PERCENT:
+			return 4;
 		case Type::PLUS:
 		case Type::MINUS:
-			return 2;
+			return 3;
 		case Type::LESS:
 		case Type::GREATER:
+			return 2;
+		case Type::EQUALS:
 			return 1;
 		/*case Type::LESS:
 		case Type::LEQ:
@@ -47,7 +50,9 @@ std::string Function::GenerateSignature() const {
 			out += ',';
 		}
 	}
-	return out + ")";
+	out += +')';
+
+	return out;
 }
 
 std::unique_ptr<Expression> Parser::ParsePrimaryExpr() {
@@ -59,20 +64,27 @@ std::unique_ptr<Expression> Parser::ParsePrimaryExpr() {
 		auto beginIdx = tokenizer.GetIdx();
 
 		// If function
-		if (tokenizer.Get().type == TokenType::OPEN_PARENTH) {
+		if (tokenizer.Get().IsOfType(TokenType::OPEN_PARENTH)) {
 			tokenizer.Next();
 			std::vector<std::unique_ptr<Expression>> params;
 
-			if (tokenizer.Get().type == TokenType::CLOSED_PARENTH) {
+			if (tokenizer.Get().IsOfType(TokenType::CLOSED_PARENTH)) {
 				tokenizer.Next();
 				assert(currentScope->FindFunc(name));
 				return std::make_unique<FuncCallExpr>(name, std::move(params));
 			}
 
 			if (name.value == "sizeof") {
-				auto typeSz = GetType()->size;
-				assert(tokenizer.Next().type == TokenType::CLOSED_PARENTH);
-				return std::make_unique<ValueExpr>(Token{TokenType::INTEGER, 0, 0, std::to_string(typeSz)});
+				std::uint32_t typeSize = 0;
+
+				if (auto paramType = GetType()) {
+					typeSize = paramType->size;
+				}
+				else if (auto variable = currentScope->FindVar(tokenizer.Get())) {
+					typeSize = variable->type->size;
+				}
+				assert(tokenizer.Next().IsOfType(TokenType::CLOSED_PARENTH));
+				return std::make_unique<ValueExpr>(Token{TokenType::INTEGER, 0, 0, std::to_string(typeSize)});
 			}
 
 			while (true) {
@@ -80,13 +92,9 @@ std::unique_ptr<Expression> Parser::ParsePrimaryExpr() {
 				assert(expr);
 
 				params.emplace_back(std::move(expr));
-				if (tokenizer.Get().type == TokenType::COMMA) {
+				if (tokenizer.Get().IsOfType(TokenType::COMMA)) {
 					tokenizer.Next();
 					continue;
-				}
-
-				if (tokenizer.Get().type != TokenType::CLOSED_PARENTH) {
-					return nullptr;
 				}
 
 				tokenizer.Next();
@@ -105,27 +113,42 @@ std::unique_ptr<Expression> Parser::ParsePrimaryExpr() {
 				}
 			}
 
+
 			assert(currentScope->FindFunc(name));
 			return std::make_unique<FuncCallExpr>(name, std::move(params));
 		}
 		// Member
-		else if (tokenizer.Get().type == TokenType::DOT) {
+		else if (tokenizer.Get().IsOfType(TokenType::DOT)) {
 
 		}
 		else {
 			assert(currentScope->FindVar(name));
+
+			// If unary
+			if (tokenizer.Get().IsOfAnyType(TokenType::INCREMENT, TokenType::DECREMENT)) {
+				return std::make_unique<UnaryExpr>(std::make_unique<ValueExpr>(name), tokenizer.Next());
+			}
+
 			return std::make_unique<ValueExpr>(name);
 		}
 		return nullptr;
 	}
-	else if (tokenizer.Get().type == TokenType::OPEN_PARENTH) {
+	else if (tokenizer.Get().IsOfAnyType(TokenType::INCREMENT, TokenType::DECREMENT)) {
+		auto op = tokenizer.Next();
+		auto name = tokenizer.Next();
+
+		assert(currentScope->FindVar(name));
+
+		return std::make_unique<UnaryExpr>(std::make_unique<ValueExpr>(name), op);
+	}
+	else if (tokenizer.Get().IsOfType(TokenType::OPEN_PARENTH)) {
 		tokenizer.Next();
-		if (tokenizer.Get().type == TokenType::TYPE_STRUCT) {
+		if (tokenizer.Get().IsOfType(TokenType::TYPE_STRUCT)) {
 			tokenizer.Next();
 		}
 
 		auto *finalType = currentScope->FindType(tokenizer.Next());
-		assert(tokenizer.Next().type == TokenType::CLOSED_PARENTH);
+		assert(tokenizer.Next().IsOfType(TokenType::CLOSED_PARENTH));
 		auto expression = ParseExpr();
 		auto *evaledType = EvalType(*expression.get());
 		return std::make_unique<CastExpr>(evaledType, finalType, std::move(expression));
@@ -256,13 +279,13 @@ const Type *Scope::FindType(Token name) const {
 	if (parent) return parent->FindType(name);
 	return nullptr;
 }
-const Variable *Scope::FindVar(Token name) const{
+const Variable *Scope::FindVar(Token name, bool thisScope) const{
 	for (auto &var : vars) {
 		if (var->name.value != name.value) continue;
 		return var.get();
 	}
 
-	return parent ? parent->FindVar(name) : nullptr;
+	return (parent && !thisScope) ? parent->FindVar(name) : nullptr;
 }
 const Function *Scope::FindFunc(Token name) const{
 	if (parent) {
@@ -296,13 +319,14 @@ std::unique_ptr<VarDeclStmt> Parser::ParseVarDecl(bool isParam){
 	}
 	return std::make_unique<VarDeclStmt>(varName, type, static_cast<Modifiers>(0), std::move(expr));
 }
-std::unique_ptr<VarAssignStmt> Parser::ParseVarAssign() {
+std::unique_ptr<VarAssignStmt> Parser::ParseVarAssign(bool checkSemicolon) {
 	auto varName = tokenizer.Next();
 	assert(varName.type == TokenType::IDENT);
 	assert(tokenizer.Next().type == TokenType::ASSIGN);
 
 	auto ret = std::make_unique<VarAssignStmt>(varName, std::move(ParseExpr()));
-	assert(tokenizer.Next().type == TokenType::SEMICOLON);
+	if(checkSemicolon)
+		assert(tokenizer.Next().type == TokenType::SEMICOLON);
 
 	return ret;
 }
@@ -386,11 +410,30 @@ std::unique_ptr<WhileStmt> Parser::ParseWhile() {
 
 	return std::make_unique<WhileStmt>(std::move(expr), std::move(then));
 }
+std::unique_ptr<ForStmt> Parser::ParseFor() {
+	assert(tokenizer.Next().type == TokenType::FOR);
+	assert(tokenizer.Next().type == TokenType::OPEN_PARENTH);
+
+	auto initialStmt = ParseStmt();
+	auto condition = ParseExpr();
+	assert(tokenizer.Next().type == TokenType::SEMICOLON);
+	auto postLoopStmt = ParseStmt(false);
+	assert(tokenizer.Next().type == TokenType::CLOSED_PARENTH);
+
+	if (tokenizer.Get().type != TokenType::OPEN_BRACE) {
+		auto then = ParseStmt();
+
+		return std::make_unique<ForStmt>(std::move(initialStmt), std::move(condition), std::move(postLoopStmt), std::move(then));
+	}
+	tokenizer.Next();
+
+	auto then = ParseBlock();
+	assert(tokenizer.Next().type == TokenType::CLOSED_BRACE);
+
+	return std::make_unique<ForStmt>(std::move(initialStmt), std::move(condition), std::move(postLoopStmt), std::move(then));
+}
 std::unique_ptr<BlockStmt> Parser::ParseBlock() {
 	std::unique_ptr<BlockStmt> ret = std::make_unique<BlockStmt>();
-	currentScope->children.push_back(std::make_unique<Scope>());
-	currentScope->children.back()->parent = currentScope;
-	currentScope = currentScope->children.back().get();
 
 	std::unique_ptr<Statement> stmt;
 	while (stmt = ParseStmt()) {
@@ -399,8 +442,6 @@ std::unique_ptr<BlockStmt> Parser::ParseBlock() {
 		}
 		ret->AddStmt(stmt);
 	}
-
-	currentScope = currentScope->parent;
 
 	return ret;
 }
@@ -411,6 +452,10 @@ std::unique_ptr<FuncDeclStmt> Parser::ParseFunc() {
 	assert(ident.type == TokenType::IDENT); tokenizer.Next();
 	assert(tokenizer.Next().type == TokenType::OPEN_PARENTH);
 	assert(currentScope->FindFunc(ident) == nullptr);
+
+	currentScope->children.push_back(std::make_unique<Scope>());
+	currentScope->children.back()->parent = currentScope;
+	currentScope = currentScope->children.back().get();
 
 	std::vector<std::unique_ptr<VarDeclStmt>> params;
 	while (tokenizer.Get().type != TokenType::CLOSED_PARENTH) {
@@ -427,20 +472,22 @@ std::unique_ptr<FuncDeclStmt> Parser::ParseFunc() {
 
 	if (tokenizer.Get().type == TokenType::SEMICOLON) {
 		tokenizer.Next();
+
 		return std::make_unique<FuncDeclStmt>(retType, ident, &params);
 	}
+
+	std::vector<Variable> vars;
+	for (auto &param : params) {
+		vars.push_back(param->var);
+		currentScope->vars.push_back(std::make_unique<Variable>(param->var));
+	}
+	currentScope->parent->funcs.push_back(std::make_unique<Function>(true, retType, ident, vars));
 	
 	assert(tokenizer.Next().type == TokenType::OPEN_BRACE);
 	auto definition = ParseBlock();
 	assert(tokenizer.Next().type == TokenType::CLOSED_BRACE);
 
-	std::vector<Variable> vars;
-	auto funcScope = currentScope->children.back().get();
-	for (auto &param : params) {
-		vars.push_back(param->var);
-		funcScope->vars.push_back(std::make_unique<Variable>(param->var));
-	}
-	currentScope->funcs.push_back(std::make_unique<Function>(true, retType, ident, vars));
+	currentScope = currentScope->parent;
 	return std::unique_ptr<FuncDeclStmt>{new FuncDeclStmt(retType, ident, definition, &params)};
 }
 std::unique_ptr<ReturnStmt> Parser::ParseReturn() {
@@ -450,7 +497,7 @@ std::unique_ptr<ReturnStmt> Parser::ParseReturn() {
 	return ret;
 }
 
-std::unique_ptr<Statement> Parser::ParseStmt() {
+std::unique_ptr<Statement> Parser::ParseStmt(bool checkSemicolon) {
 	while (tokenizer.Get().type == TokenType::TYPE_STRUCT) {
 		auto t = ParseType();
 		if (t) currentScope->types.emplace_back(std::move(t));
@@ -458,6 +505,7 @@ std::unique_ptr<Statement> Parser::ParseStmt() {
 
 	switch(tokenizer.Get().type) {
 		case TokenType::IF: return ParseIf();
+		case TokenType::FOR: return ParseFor();
 		case TokenType::WHILE: return ParseWhile();
 		case TokenType::OPEN_BRACE: return ParseBlock();
 		case TokenType::RETURN: return ParseReturn();
@@ -479,20 +527,44 @@ std::unique_ptr<Statement> Parser::ParseStmt() {
 		}
 		return ParseVarDecl();
 	}
-	else if (tokenizer.Get().type == TokenType::IDENT) {
+	else if (tokenizer.Get().IsOfType(TokenType::IDENT)) {
 		auto idx = tokenizer.GetIdx();
 		tokenizer.Next();
 		if (tokenizer.Get().type != TokenType::OPEN_PARENTH) {
+			if (tokenizer.Get().IsOfAnyType(TokenType::INCREMENT, TokenType::DECREMENT)) {
+				tokenizer.SetIdx(idx);
+				auto unaryExpr = std::make_unique<ExpressionStmt>(std::move(ParseExpr()));
+				if(checkSemicolon)
+					assert(tokenizer.Next().type == TokenType::SEMICOLON);
+				return unaryExpr;
+			}
 			tokenizer.SetIdx(idx);
-			return ParseVarAssign();
+			return ParseVarAssign(checkSemicolon);
 		}
 		tokenizer.Next();
 
 		tokenizer.SetIdx(idx);
 		auto funccall = ParsePrimaryExpr();
-		assert(tokenizer.Next().type == TokenType::SEMICOLON);
+		if (checkSemicolon)
+			assert(tokenizer.Next().IsOfType(TokenType::SEMICOLON));
 
 		return std::make_unique<ExpressionStmt>(std::move(funccall));
+	}
+	else if (tokenizer.Get().IsOfAnyType(TokenType::BREAK, TokenType::CONTINUE)) {
+		auto ret = tokenizer.Next().IsOfType(TokenType::BREAK) ? 
+			static_cast<std::unique_ptr<Statement>>(std::make_unique<BreakStmt>()) : 
+			static_cast<std::unique_ptr<Statement>>(std::make_unique<ContinueStmt>());
+
+		if (checkSemicolon)
+			assert(tokenizer.Next().IsOfType(TokenType::SEMICOLON));
+
+		return ret;
+	}
+	else if (tokenizer.Get().IsOfAnyType(TokenType::INCREMENT, TokenType::DECREMENT)) {
+		auto unaryExpr = std::make_unique<ExpressionStmt>(std::move(ParseExpr()));
+		if (checkSemicolon)
+			assert(tokenizer.Next().type == TokenType::SEMICOLON);
+		return unaryExpr;
 	}
 
 	return nullptr;

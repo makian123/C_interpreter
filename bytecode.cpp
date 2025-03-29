@@ -6,10 +6,16 @@
 void GenerateBytecode(std::ostream &out, Statement &stmt);
 
 namespace {
+	using UnfinishedBreak = std::uint32_t;
 	Parser *globalParser = nullptr;
 	Scope *currScope = nullptr;
 	std::uint32_t varIdx = 0, currFuncIdx = 0;
 	std::stack<std::unordered_map<std::string, std::pair<std::uint32_t, VarDeclStmt*>>> vars;
+
+	// Loop stuff
+	std::stack<std::uint32_t> loopBeginBytes;
+	std::stack<std::vector<UnfinishedBreak>> unfinishedBreaks;
+	std::stack<Statement *> postLoopStatements;
 	
 	std::uint32_t GetVariableIdx(const std::string &toFind) {
 		if (!vars.size()) {
@@ -94,6 +100,12 @@ namespace {
 		case TokenType::SLASH:
 			out << GetCode(floating ? InstructionCode::FDIV : InstructionCode::IDIV);
 			break;
+		case TokenType::PERCENT:
+			out << GetCode(InstructionCode::MOD);
+			break;
+		case TokenType::EQUALS:
+			out << GetCode(floating ? InstructionCode::FEQ : InstructionCode::IEQ);
+			break;
 		case TokenType::LESS:
 			out << GetCode(floating ? InstructionCode::FLE : InstructionCode::ILE);
 			break;
@@ -101,6 +113,11 @@ namespace {
 			out << GetCode(floating ? InstructionCode::FGE : InstructionCode::IGE);
 			break;
 		}
+	}
+	void GenerateUnaryBytecode(std::ostream &out, UnaryExpr &expr) {
+		out << GetCode(expr.op.type == TokenType::INCREMENT ? InstructionCode::INC : InstructionCode::DEC);
+		std::uint32_t variableIndex = GetVariableIdx(expr.expr->val.value);
+		out.write(reinterpret_cast<char *>(&variableIndex), sizeof(variableIndex));
 	}
 	void GenerateCastBytecode(std::ostream &out, CastExpr &expr) {
 		GenerateExprBytecode(out, *expr.expr.get());
@@ -114,18 +131,12 @@ namespace {
 		for (auto &param: expr.params) {
 			GenerateExprBytecode(out, *param);
 		}
-
+		
 		out << GetCode(InstructionCode::FUNCTIONCALL);
-		out << expr.func.value << "(";
-		for (auto it = expr.params.begin(); it != expr.params.end(); ++it) {
-			const auto *type = globalParser->EvalType(*it->get(), currScope);
-
-			if (it != expr.params.end() - 1) {
-				out << type->name.value << ",";
-			}
-		}
-		out << ")";
-		out.put('\0');
+		std::string funcSig = currScope->FindFunc(expr.func)->GenerateSignature() + '\n';
+		out << funcSig;//(funcSig.data(), funcSig.size());
+		const std::uint32_t paramSz = expr.params.size();
+		out.write(reinterpret_cast<const char *>(&paramSz), sizeof(paramSz));
 	}
 	void GenerateExprBytecode(std::ostream &out, Expression &expr) {
 		switch (expr.type) {
@@ -134,6 +145,9 @@ namespace {
 				break;
 			case ExpressionType::BINARY:
 				GenerateBinaryBytecode(out, static_cast<BinaryExpression &>(expr));
+				break;
+			case ExpressionType::UNARY:
+				GenerateUnaryBytecode(out, static_cast<UnaryExpr &>(expr));
 				break;
 			case ExpressionType::CAST:
 				GenerateCastBytecode(out, static_cast<CastExpr &>(expr));
@@ -153,7 +167,9 @@ namespace {
 		out.write(reinterpret_cast<char *>(&offset), sizeof(offset));
 		auto position = out.tellp();
 
+		vars.emplace();
 		GenerateBytecode(out, *stmt.then);
+		vars.pop();
 
 		// Skip else when finished
 		out << GetCode(InstructionCode::SKIP);
@@ -169,7 +185,9 @@ namespace {
 
 		if (stmt.els) {
 			out << GetCode(InstructionCode::ELSE);
+			vars.emplace();
 			GenerateBytecode(out, *stmt.els);
+			vars.pop();
 		}
 
 		int ifStmtEnd = out.tellp();
@@ -181,24 +199,95 @@ namespace {
 	}
 	void GenerateWhileBytecode(std::ostream &out, WhileStmt &stmt) {
 		std::uint32_t endWhileOff = 0;
+
 		int whileStartPos = out.tellp();
+		loopBeginBytes.push(whileStartPos);
+		unfinishedBreaks.emplace();
 		GenerateExprBytecode(out, *stmt.condition);
 
 		out << GetCode(InstructionCode::WHILE);
 		int whileSkipPos = out.tellp();
 		out.write(reinterpret_cast<char *>(&endWhileOff), sizeof(endWhileOff));
+
+		vars.emplace();
 		GenerateBytecode(out, *stmt.then);
+		vars.pop();
 
 		out << GetCode(InstructionCode::BACK);
-		std::uint32_t backBytes = (int)out.tellp() - whileStartPos + 4;
+		std::uint32_t backBytes = (int)out.tellp() - whileStartPos + sizeof(endWhileOff);
 		out.write(reinterpret_cast<char *>(&backBytes), sizeof(backBytes));
 
-		int whileEndPos = out.tellp();
-		endWhileOff = (whileEndPos - whileSkipPos) - 4;
+		int loopEnd = out.tellp();
+		endWhileOff = (loopEnd - whileSkipPos) - sizeof(endWhileOff);
 		out.seekp(whileSkipPos, out.beg);
 		out.write(reinterpret_cast<char *>(&endWhileOff), sizeof(endWhileOff));
 
+		for (const auto &unfinishedBreak : unfinishedBreaks.top()) {
+			std::uint32_t offset = loopEnd - unfinishedBreak - sizeof(uint32_t);
+			out.seekp(unfinishedBreak, out.beg);
+			out.write(reinterpret_cast<char *>(&offset), sizeof(offset));
+		}
+
 		out.seekp(0, out.end);
+		unfinishedBreaks.pop();
+		loopBeginBytes.pop();
+	}
+	void GenerateForBytecode(std::ostream &out, ForStmt &stmt) {
+		std::uint32_t offset = 0;
+
+		vars.emplace();
+		unfinishedBreaks.emplace();
+		postLoopStatements.push(stmt.postLoop.get());
+		GenerateBytecode(out, *stmt.initial);
+
+		int conditionPos = out.tellp();
+		loopBeginBytes.push(conditionPos);
+		GenerateExprBytecode(out, *stmt.condition);
+
+		out << GetCode(InstructionCode::FOR);
+		auto offsetPos = out.tellp();
+		out.write(reinterpret_cast<char *>(&offset), sizeof(offset));
+
+		GenerateBytecode(out, *stmt.then);
+		GenerateBytecode(out, *stmt.postLoop);
+
+		out << GetCode(InstructionCode::BACK);
+		// Go back to start of loop (conditions)
+		offset = (int)out.tellp() - conditionPos + sizeof(offset);
+		out.write(reinterpret_cast<char*>(&offset), sizeof(offset));
+
+		// Skip loop size in bytes
+		int loopEnd = out.tellp();
+		offset = loopEnd - offsetPos - sizeof(offset);
+		out.seekp(offsetPos, out.beg);
+		out.write(reinterpret_cast<char *>(&offset), sizeof(offset));
+
+		for (const auto &unfinishedBreak : unfinishedBreaks.top()) {
+			std::uint32_t offset = loopEnd - unfinishedBreak - sizeof(uint32_t);
+			out.seekp(unfinishedBreak, out.beg);
+			out.write(reinterpret_cast<char *>(&offset), sizeof(offset));
+		}
+
+		out.seekp(0, out.end);
+		unfinishedBreaks.pop();
+		vars.pop();
+		loopBeginBytes.pop();
+		postLoopStatements.pop();
+	}
+	void GenerateContinueBytecode(std::ostream &out, ContinueStmt &stmt) {
+		if (postLoopStatements.size() && postLoopStatements.top()) {
+			GenerateBytecode(out, *postLoopStatements.top());
+		}
+		out << GetCode(InstructionCode::BACK);
+		int backPos = out.tellp();
+		std::uint32_t backbytes = backPos - loopBeginBytes.top() + sizeof(uint32_t);
+		out.write(reinterpret_cast<char *>(&backbytes), sizeof(backbytes));
+	}
+	void GenerateBreakBytecode(std::ostream &out, BreakStmt &stmt) {
+		out << GetCode(InstructionCode::SKIP);
+		std::uint32_t skipCnt = 0;
+		unfinishedBreaks.top().push_back(out.tellp());
+		out.write(reinterpret_cast<char *>(&skipCnt), sizeof(skipCnt));
 	}
 	void GenerateBlockBytecode(std::ostream &out, BlockStmt &stmt) {
 		for (auto &stmt_child : stmt.stmts) {
@@ -215,7 +304,7 @@ namespace {
 
 		out << GetCode(InstructionCode::FUNCTION);
 		out << currScope->FindFunc(stmt.name)->GenerateSignature();
-		out.put('\0');
+		out.put('\n');
 		GenerateBlockBytecode(out, *stmt.definition.get());
 		out << GetCode(InstructionCode::ENDFUNC);
 
@@ -235,8 +324,8 @@ namespace {
 	}
 	void GenerateVarAssignBytecode(std::ostream &out, VarAssignStmt &stmt) {
 		GenerateExprBytecode(out, *stmt.val);
-		auto idx = vars.top()[stmt.name.value].first;
-		bool floating = vars.top()[stmt.name.value].second->var.type->name.value == "float";
+		auto idx = GetVariableIdx(stmt.name.value);
+		bool floating = GetVariableStmt(idx)->var.type->name.value == "float";
 
 		out << GetCode(floating ? InstructionCode::FSTORE : InstructionCode::ISTORE);
 		out.write(reinterpret_cast<char *>(&idx), sizeof(idx));
@@ -275,6 +364,18 @@ void GenerateBytecode(std::ostream &out, Statement &stmt) {
 	case StatementType::WHILE:
 		GenerateWhileBytecode(out, static_cast<WhileStmt &>(stmt));
 		break;
+	case StatementType::FOR:
+		GenerateForBytecode(out, static_cast<ForStmt &>(stmt));
+		break;
+	case StatementType::BREAK:
+		GenerateBreakBytecode(out, static_cast<BreakStmt &>(stmt));
+		break;
+	case StatementType::CONTINUE:
+		GenerateContinueBytecode(out, static_cast<ContinueStmt &>(stmt));
+		break;
+	case StatementType::EXPRSTMT:
+		GenerateExprBytecode(out, *static_cast<ExpressionStmt &>(stmt).expr);
+		break;
 	}
 }
 void GenerateBytecode(std::ostream &out, Statement &stmt, Parser &parser) {
@@ -294,8 +395,8 @@ void GenerateBytecode(std::ostream &out, Statement &stmt, Parser &parser) {
 
 void PrintNextBytecode(std::istream &in) {
 	InstructionCode code;
+	std::cout << in.tellg() << ": ";
 	in.read(reinterpret_cast<char *>(&code), sizeof(InstructionCode));
-
 	switch (code) {
 		case InstructionCode::SKIP: {
 			std::uint32_t skipBytes = 0;
@@ -362,6 +463,15 @@ void PrintNextBytecode(std::istream &in) {
 			std::cout << "DIV\n";
 			break;
 		}
+		case InstructionCode::INC:
+		
+		case InstructionCode::DEC: {
+			std::uint32_t varIdx = 0;
+			in.read(reinterpret_cast<char*>(&varIdx), sizeof(varIdx));
+			std::cout << (code == InstructionCode::INC ? "INC" : "DEC") << " #" << varIdx << '\n';
+
+			break;
+		}
 		case InstructionCode::ILE:
 		case InstructionCode::FLE: {
 			std::cout << "LESS\n";
@@ -370,6 +480,11 @@ void PrintNextBytecode(std::istream &in) {
 		case InstructionCode::IGE:
 		case InstructionCode::FGE: {
 			std::cout << "GREATER\n";
+			break;
+		}
+		case InstructionCode::IEQ:
+		case InstructionCode::FEQ: {
+			std::cout << "EQUALS\n";
 			break;
 		}
 
@@ -389,10 +504,16 @@ void PrintNextBytecode(std::istream &in) {
 			std::cout << "WHILE (skip " << codeSz << " bytes)\n";
 			break;
 		}
+		case InstructionCode::FOR: {
+			std::uint32_t codeSz = 0;
+			in.read(reinterpret_cast<char *>(&codeSz), sizeof(codeSz));
+			std::cout << "FOR (skip " << codeSz << " bytes)\n";
+			break;
+		}
 
 		case InstructionCode::FUNCTION: {
 			std::string funcSig;
-			while (in.peek() != '\0') {
+			while (in.peek() != '\n') {
 				funcSig += in.get();
 			}
 			int ch = in.get();
@@ -405,13 +526,19 @@ void PrintNextBytecode(std::istream &in) {
 			in.get();
 			break;
 		}
+		case InstructionCode::ENDFUNC: {
+			std::cout << "ENDFUNC\n";
+			break;
+		}
 		case InstructionCode::FUNCTIONCALL: {
 			std::cout << "CALL ";
-			while (in.peek() != '\0') {
+			while (in.peek() != '\n') {
 				std::cout << (char)in.get();
 			}
-			std::cout << '\n';
 			in.get();
+			std::uint32_t params = 0;
+			in.read(reinterpret_cast<char *>(&params), sizeof(params));
+			std::cout << " (" << params << ") params\n";
 			break;
 		}
 		case InstructionCode::IRET:
